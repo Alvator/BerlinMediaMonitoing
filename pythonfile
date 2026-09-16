@@ -1,0 +1,273 @@
+import json
+import re
+import urllib.parse
+from datetime import datetime
+import feedparser
+import pandas as pd
+import plotly.express as px
+import requests
+import streamlit as st
+
+# Optional: Google Gemini API Client
+try:
+    from google import genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+
+st.set_page_config(
+    page_title="Berlin Election Pulse | Media & Discourse Monitor",
+    page_icon="🗳️",
+    layout="wide"
+)
+
+# -------------------------------------------------------------
+# 1. DATENQUELLEN (Meinungsmedien & Diskurs)
+# -------------------------------------------------------------
+NEWS_FEEDS = {
+    "RBB24 Berlin": "https://www.rbb24.de/politik/index.xml/feed=rss.xml",
+    "Tagesspiegel Berlin": "https://www.tagesspiegel.de/berlin/rss",
+    "Berliner Zeitung": "https://www.berliner-zeitung.de/feed.xml"
+}
+
+TOPIC_KEYWORDS = {
+    "Wohnen & Mieten": ["wohnen", "miete", "enteignung", "bau", "wohnung", "vorkaufsrecht", "obdachlos"],
+    "Verkehr & Mobilität": ["u-bahn", "s-bahn", "bvg", "radweg", "auto", "a100", "parkplatz", "verkehr"],
+    "Innere Sicherheit & Polizei": ["polizei", "kriminalität", "sicherheit", "clans", "görlitzer park", "justiz"],
+    "Verwaltung & Bürgerdienste": ["bürgeramt", "termin", "digitalisierung", "haushalt", "senat", "bezirke"],
+    "Klima & Energie": ["klima", "wärmewende", "gruen", "erneuerbar", "hitze", "energie"]
+}
+
+PARTIES = ["SPD", "CDU", "Grüne", "Linke", "AfD", "FDP", "BSW"]
+
+# -------------------------------------------------------------
+# 2. INGESTION ENGINE
+# -------------------------------------------------------------
+def fetch_media_articles(limit_per_source: int = 15):
+    """Liest RSS-Feeds relevanter Berliner Medien aus."""
+    articles = []
+    for source_name, url in NEWS_FEEDS.items():
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:limit_per_source]:
+                title = entry.get("title", "")
+                summary = entry.get("summary", "")
+                clean_summary = re.sub("<[^<]+?>", "", summary)
+                published = entry.get("published", "")
+                link = entry.get("link", "#")
+
+                articles.append({
+                    "Quelle": source_name,
+                    "Medium": "Leitmedium",
+                    "Titel": title,
+                    "Text": clean_summary,
+                    "Link": link,
+                    "Datum": published
+                })
+        except Exception as e:
+            st.sidebar.warning(f"Fehler bei {source_name}: {e}")
+    return articles
+
+def fetch_reddit_berlin(query: str = "Wahl", limit: int = 25):
+    """Liest aktuelle Diskussions-Threads aus r/berlin aus."""
+    articles = []
+    url = f"https://www.reddit.com/r/berlin/search.json?q={urllib.parse.quote(query)}&sort=new&limit={limit}"
+    headers = {"User-Agent": "PoliticalMediaMonitor/1.0"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=8)
+        if resp.status_code == 200:
+            posts = resp.json().get("data", {}).get("children", [])
+            for post in posts:
+                pdata = post.get("data", {})
+                articles.append({
+                    "Quelle": "r/berlin (Reddit)",
+                    "Medium": "Social Discourse",
+                    "Titel": pdata.get("title", ""),
+                    "Text": pdata.get("selftext", "")[:400],
+                    "Link": f"https://reddit.com{pdata.get('permalink')}",
+                    "Datum": datetime.fromtimestamp(pdata.get("created_utc", 0)).strftime("%Y-%m-%d")
+                })
+    except Exception:
+        pass
+    return articles
+
+# -------------------------------------------------------------
+# 3. NLP- & DISKURS-ANALYSE
+# -------------------------------------------------------------
+def analyze_text(row):
+    combined = f"{row['Titel']} {row['Text']}".lower()
+
+    # Thematisches Tagging
+    assigned_topics = []
+    for topic, words in TOPIC_KEYWORDS.items():
+        if any(w in combined for w in words):
+            assigned_topics.append(topic)
+    row["Thema"] = assigned_topics[0] if assigned_topics else "Allgemeine Landespolitik"
+
+    # Partei-Erwähnungen
+    detected_parties = [p for p in PARTIES if re.search(r'\b' + re.escape(p.lower()) + r'\b', combined)]
+    row["Parteien"] = ", ".join(detected_parties) if detected_parties else "Neutral / Keine"
+
+    # Sentiment Heuristik (Computational Lexicon)
+    pos_words = ["erfolg", "lösung", "fortschritt", "einigung", "investition", "modern", "chancen", "zuwachs"]
+    neg_words = ["krise", "streit", "chaos", "verzug", "panne", "kritik", "mangel", "versagen", "teuer", "verfehlt"]
+
+    pos_score = sum(combined.count(w) for w in pos_words)
+    neg_score = sum(combined.count(w) for w in neg_words)
+
+    if pos_score > neg_score:
+        sentiment = "Positiv"
+        val = 1
+    elif neg_score > pos_score:
+        sentiment = "Negativ / Kritisch"
+        val = -1
+    else:
+        sentiment = "Neutral / Berichterstattung"
+        val = 0
+
+    row["Tonalität"] = sentiment
+    row["Sentiment_Val"] = val
+    return row
+
+# -------------------------------------------------------------
+# 4. LLM BRIEFING GENERATOR (Gemini API)
+# -------------------------------------------------------------
+def generate_political_briefing(df: pd.DataFrame, api_key: str):
+    """Erstellt ein präzises Risiko- und Narrativ-Memo für Public Affairs Agenturen."""
+    client = genai.Client(api_key=api_key)
+    
+    # Stichprobe relevanter Beiträge aufbereiten
+    sample_headlines = "\n".join([f"- [{r['Quelle']} | {r['Thema']}] {r['Titel']} ({r['Tonalität']})" for _, r in df.head(20).iterrows()])
+    
+    prompt = f"""
+    Du bist Senior Political & Media Analyst in einer führenden Public-Affairs-Beratung in Berlin.
+    Analysiere die folgenden aktuellen Medienberichte und Social-Media-Debatten zum Berliner Wahlkampf:
+
+    {sample_headlines}
+
+    Erstelle ein strukturiertes Executive Briefing für Mandanten mit folgenden Abschnitten:
+    1. **Dominante Narrative & Framing**: Welche Themen beherrschen aktuell die Agenda?
+    2. **Akteurs- & Parteien-Dynamik**: Wer steht unter Druck, wer kann Themen setzen?
+    3. **Risikoanalyse für Kampagnen**: Wo drohen Shitstorms oder Reputationsverluste?
+    4. **Strategische Handlungsempfehlung**: Wie sollten Kommunikatoren in dieser Woche reagieren?
+
+    Halte die Sprache prägnant, analytisch und politikwissenschaftlich fundiert.
+    """
+    response = client.models.generate_content(
+        model='gemini-2.5-flash',
+        contents=prompt,
+    )
+    return response.text
+
+# =============================================================
+# 5. STREAMLIT FRONTEND
+# =============================================================
+st.title("🗳️ Berlin Election Pulse: Computational Media Monitoring")
+st.markdown("*Automatisiertes Agenda-Setting- & Tonalitäts-Monitoring für Meinungsmedien und digitale Diskurse.*")
+
+# Sidebar
+with st.sidebar:
+    st.header("⚙️ Daten-Pipelines")
+    include_rbb = st.checkbox("RBB24 / Tagesspiegel / Berliner Ztg.", value=True)
+    include_reddit = st.checkbox("Reddit r/berlin (Social Discourse)", value=True)
+    reddit_query = st.text_input("Reddit Suchfokus:", value="Senat OR Wahl OR Berlin")
+    
+    st.markdown("---")
+    st.header("🤖 AI Executive Briefing")
+    gemini_key = st.text_input("Gemini API Key (für PA-Memos):", type="password")
+
+    btn_refresh = st.button("🚀 Monitoring ausführen", type="primary")
+
+# Datenverarbeitung
+if btn_refresh or "monitor_data" not in st.session_state:
+    data = []
+    with st.spinner("Erfasse Medienberichte und Diskursbeiträge..."):
+        if include_rbb:
+            data.extend(fetch_media_articles(limit_per_source=15))
+        if include_reddit:
+            data.extend(fetch_reddit_berlin(query=reddit_query, limit=25))
+
+        if data:
+            df = pd.DataFrame(data)
+            df = df.apply(analyze_text, axis=1)
+            st.session_state.monitor_data = df
+        else:
+            st.session_state.monitor_data = pd.DataFrame()
+
+df = st.session_state.monitor_data
+
+if df.empty:
+    st.warning("Keine Daten geladen. Bitte Datenquellen aktivieren und 'Monitoring ausführen' klicken.")
+else:
+    # Key Performance Indicators
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Analysierte Berichte", len(df))
+    c2.metric("Dominantes Thema", df["Thema"].value_counts().idxmax())
+    neg_share = int((len(df[df["Tonalität"] == "Negativ / Kritisch"]) / len(df)) * 100)
+    c3.metric("Kritische Berichte", f"{neg_share}%")
+    c4.metric("Aktive Quellen", df["Quelle"].nunique())
+
+    st.markdown("---")
+
+    # Visualisierungen
+    v_col1, v_col2 = st.columns(2)
+
+    with v_col1:
+        st.subheader("📊 Themen-Radar (Issue Attention)")
+        topic_counts = df["Thema"].value_counts().reset_index()
+        topic_counts.columns = ["Thema", "Anzahl"]
+        fig_topics = px.bar(
+            topic_counts, 
+            x="Anzahl", 
+            y="Thema", 
+            orientation="h", 
+            color="Thema",
+            template="plotly_white"
+        )
+        fig_topics.update_layout(showlegend=False, margin=dict(l=10, r=10, t=20, b=20))
+        st.plotly_chart(fig_topics, use_container_width=True)
+
+    with v_col2:
+        st.subheader("⚖️ Tonalitätsverteilung (Sentiment)")
+        sent_counts = df["Tonalität"].value_counts().reset_index()
+        sent_counts.columns = ["Tonalität", "Anzahl"]
+        color_map = {
+            "Positiv": "#10b981", 
+            "Neutral / Berichterstattung": "#9ca3af", 
+            "Negativ / Kritisch": "#ef4444"
+        }
+        fig_sent = px.pie(
+            sent_counts, 
+            values="Anzahl", 
+            names="Tonalität", 
+            color="Tonalität",
+            color_discrete_map=color_map,
+            hole=0.4
+        )
+        fig_sent.update_layout(margin=dict(l=10, r=10, t=20, b=20))
+        st.plotly_chart(fig_sent, use_container_width=True)
+
+    # KI-Briefing Bereich
+    st.markdown("---")
+    st.subheader("📝 Public Affairs Memo (Automatisierte Lageanalyse)")
+    if gemini_key:
+        if st.button("🧠 KI-Lagebericht für diesen Datensatz generieren"):
+            with st.spinner("Gemini analysiert Narrative und Risikopotenziale..."):
+                report = generate_political_briefing(df, gemini_key)
+                st.markdown(report)
+    else:
+        st.info("💡 Gib links deinen Gemini API Key ein, um automatische Mandanten-Briefings und Risikoberichte auf Knopfdruck zu erzeugen.")
+
+    # Rohdaten-Feed
+    st.markdown("---")
+    st.subheader("📋 Ingestierte Artikel & Forenbeiträge")
+    st.dataframe(
+        df[["Quelle", "Thema", "Tonalität", "Parteien", "Titel", "Link"]],
+        column_config={
+            "Link": st.column_config.LinkColumn("Quelle öffnen", display_text="Zum Artikel ↗")
+        },
+        use_container_width=True,
+        hide_index=True
+    )
+    
+    ## Starte die App
