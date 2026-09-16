@@ -271,3 +271,5 @@ else:
     )
     
     ## Starte die App
+## Starte die App
+# streamlit run berlin_media_monitor.py
